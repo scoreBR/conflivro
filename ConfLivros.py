@@ -17,13 +17,22 @@ def extrair_texto_pdf(caminho_pdf, paginas=None):
         leitor = PdfReader(arquivo)
         if paginas is not None:
             if isinstance(paginas, int):
-                return leitor.pages[paginas].extract_text()
+                texto = leitor.pages[paginas].extract_text()
+                return texto if texto is not None else ""
             else:
-                return " ".join([leitor.pages[p].extract_text() for p in paginas])
+                textos = []
+                for p in paginas:
+                    texto = leitor.pages[p].extract_text()
+                    textos.append(texto if texto is not None else "")
+                return " ".join(textos)
         else:
-            return [pagina.extract_text() for pagina in leitor.pages]
+            textos = []
+            for pagina in leitor.pages:
+                texto = pagina.extract_text()
+                textos.append(texto if texto is not None else "")
+            return textos
 
-def extrair_informacoes(texto, buscar_administrador=False):
+def extrair_informacoes(texto_primeira, texto_segunda, texto_terceira=None, buscar_administrador=False):
     """Extrai informações do texto fornecido"""
     info = {
         'nome_fundo': None,
@@ -31,46 +40,71 @@ def extrair_informacoes(texto, buscar_administrador=False):
         'cnpj': None,
         'periodo': None
     }
-    
-    # Padrões para extração
-    padrao_cnpj = re.compile(r'\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}')
-    padrao_periodo = re.compile(r'Período:\s*(\d{2}/\d{2}/\d{4}\s*a\s*\d{2}/\d{2}/\d{4})', re.IGNORECASE)
-    padrao_nome_fundo = re.compile(r'Demonstração (?:Financeira|Contábil)\s*(.*?)\n', re.IGNORECASE)
-    
-    # Extrair CNPJ
-    cnpj_match = padrao_cnpj.search(texto)
+
+    # Extrair CNPJ (continua sendo buscado na primeira página)
+    padrao_cnpj = re.compile(r'CNPJ\s*(.{21})', re.IGNORECASE)
+    cnpj_match = padrao_cnpj.search(texto_primeira)
     if cnpj_match:
-        info['cnpj'] = cnpj_match.group()
-    
-    # Extrair Período
-    periodo_match = padrao_periodo.search(texto)
-    if periodo_match:
-        info['periodo'] = periodo_match.group(1)
-    
-    # Extrair Nome do Fundo
-    nome_match = padrao_nome_fundo.search(texto)
-    if nome_match:
-        info['nome_fundo'] = nome_match.group(1).strip()
+        info['cnpj'] = cnpj_match.group(1).strip()
+
+    # Extrair Nome do Fundo (procurar na segunda página)
+    nome_fundo = None
+    linhas_segunda = [linha.strip() for linha in texto_segunda.split('\n') if linha.strip()]
+    for idx, linha in enumerate(linhas_segunda):
+        if re.search(r'Demonstração (?:Financeira|Contábil)', linha, re.IGNORECASE):
+            if idx + 2 < len(linhas_segunda):
+                nome_fundo = f"{linhas_segunda[idx + 1]} {linhas_segunda[idx + 2]}".strip()
+            elif idx + 1 < len(linhas_segunda):
+                nome_fundo = linhas_segunda[idx + 1].strip()
+            break
+
+    if nome_fundo and "Fundo de Investimento" in nome_fundo:
+        info['nome_fundo'] = nome_fundo
     else:
-        # Fallback: pega a primeira linha não vazia
-        linhas = [linha.strip() for linha in texto.split('\n') if linha.strip()]
-        if linhas:
-            info['nome_fundo'] = linhas[0]
-    
-    # Extrair Administrador se solicitado
+        # Fallback: procurar nas primeiras linhas da segunda página
+        for linha in linhas_segunda:
+            if "fundo de investimento" in linha.lower():
+                info['nome_fundo'] = linha
+                break
+        if not info['nome_fundo'] and linhas_segunda:
+            info['nome_fundo'] = linhas_segunda[0]
+
+    # Extrair Período (procurar na segunda ou terceira página)
+    padrao_periodo = re.compile(r'(Referentes ao Exercício Findo em .*?)\n', re.IGNORECASE)
+    periodo_match = padrao_periodo.search(texto_segunda)
+    if not periodo_match and texto_terceira:
+        periodo_match = padrao_periodo.search(texto_terceira)
+
+    # Novo padrão: buscar "diversificação da carteira em"
+    if not periodo_match:
+        padrao_diversificacao = re.compile(r'30 de\s*(.*?)\n', re.IGNORECASE)
+        periodo_match = padrao_diversificacao.search(texto_segunda)
+        if not periodo_match and texto_terceira:
+            periodo_match = padrao_diversificacao.search(texto_terceira)
+
+    if periodo_match:
+        info['periodo'] = periodo_match.group(1).strip()
+
+    # Extrair Administrador (procurar em ambas as páginas)
     if buscar_administrador:
-        padrao_admin = re.compile(r'Administrador(?:a| do Fundo)?:\s*(.*?)(?:\n|$)', re.IGNORECASE)
-        admin_match = padrao_admin.search(texto)
-        if admin_match:
-            info['administrador'] = admin_match.group(1).strip()
+        padrao_admin = re.compile(r'Administrado pel[ao]\s*(.*?)\n', re.IGNORECASE)
+
+        admin_match_primeira = padrao_admin.search(texto_primeira)
+        admin_match_segunda = padrao_admin.search(texto_segunda)
+
+        if admin_match_primeira:
+            info['administrador'] = admin_match_primeira.group(1).strip()
+        elif admin_match_segunda:
+            info['administrador'] = admin_match_segunda.group(1).strip()
         else:
-            # Tenta encontrar em linhas que contenham "administrador"
-            for linha in texto.split('\n'):
+            # Busca alternativa nas linhas
+            for linha in texto_primeira.split('\n') + texto_segunda.split('\n'):
                 if 'administrador' in linha.lower() and ':' in linha:
                     info['administrador'] = linha.split(':')[-1].strip()
                     break
-    
+
     return info
+
 
 def extrair_responsaveis(texto):
     """Extrai contador/diretor responsável do texto"""
@@ -100,17 +134,14 @@ def extrair_responsaveis(texto):
 def processar_arquivo_pdf(caminho):
     """Processa um único arquivo PDF"""
     try:
-        # Extrair informações das primeiras páginas (1-3 para administrador)
-        paginas_iniciais = extrair_texto_pdf(caminho, paginas=[0, 1, 2])
-        info = extrair_informacoes(paginas_iniciais, buscar_administrador=True)
+        # Extrair texto das páginas iniciais
+        primeira_pagina = extrair_texto_pdf(caminho, 0)
+        segunda_pagina = extrair_texto_pdf(caminho, 1) if os.path.getsize(caminho) > 10000 else ""  # Verifica se o arquivo não está vazio
         
-        # Se administrador não foi encontrado nas 3 primeiras páginas, tenta apenas na primeira
-        if not info['administrador']:
-            primeira_pagina = extrair_texto_pdf(caminho, 0)
-            info_primeira = extrair_informacoes(primeira_pagina)
-            info.update(info_primeira)
+        # Extrair informações básicas
+        info = extrair_informacoes(primeira_pagina, segunda_pagina, buscar_administrador=True)
         
-        # Extrair informações das últimas páginas (penúltima e última)
+        # Extrair informações das últimas páginas
         todas_paginas = extrair_texto_pdf(caminho)
         num_paginas = len(todas_paginas)
         ultimas_paginas = []
